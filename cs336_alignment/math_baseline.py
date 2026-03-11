@@ -1,7 +1,7 @@
 import os
 from pathlib import Path
 import json
-from typing import Callable, List, Dict
+from typing import Callable, List
 import hashlib
 
 from vllm import LLM, SamplingParams

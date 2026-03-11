@@ -1,14 +1,19 @@
 import json
+import os
 from typing import override
 from pathlib import Path
 import torch
 from torch import Tensor
 import torch.nn.functional as F
+from torch.optim import AdamW
 from torch.utils.data import Dataset, DataLoader
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers import PreTrainedModel, PreTrainedTokenizerBase
 from loguru import logger as log
-from vllm.utils.torch_utils import set_random_seed as vllm_set_random_seed
+
+# vLLM 0.14.1 defaults to `fork`, which breaks CUDA once the parent process
+# has touched torch. Force `spawn` before vLLM creates worker processes.
+os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 from vllm import LLM
 from unittest.mock import patch
 
@@ -93,17 +98,18 @@ def log_generations():
 def init_vllm(
     model_id: str, device: str, seed: int, gpu_memory_utilization: float = 0.85
 ):
-    vllm_set_random_seed(seed)
-    world_size_patch = patch("orch.distributed.get_world_size", return_value=1)
-    profiling_path = patch(
-        "vllm.worker.worker.Worker._assert_memory_footprint_increased_during_profiling",
-        return_value=None,
-    )
-    with world_size_patch, profiling_path:
+    world_size_patch = patch("torch.distributed.get_world_size", return_value=1)
+    with world_size_patch:
+        if device != "cuda":
+            log.warning(
+                "vLLM 0.14.1 LLM() does not take `device`; requested device={} "
+                "will be ignored and vLLM will use platform default.",
+                device,
+            )
         return LLM(
             model=model_id,
-            device=device,
-            dtype=torch.bfloat16,
+            seed=seed,
+            dtype="bfloat16",
             enable_prefix_caching=True,
             gpu_memory_utilization=gpu_memory_utilization,
         )
@@ -116,17 +122,21 @@ def load_policy_into_vllm_instance(policy: PreTrainedModel, llm: LLM):
 
 
 class MATHDataet(Dataset):
-    def __init__(self, data_path: str, tokenizer: PreTrainedTokenizerBase):
+    def __init__(
+        self, prompt_path: str, data_path: str, tokenizer: PreTrainedTokenizerBase
+    ):
         super().__init__()
+        with open(prompt_path, "r") as f:
+            prompt_template = f.read()
         path = Path(data_path)
         prompts = []
         solutions = []
-        for f in path.rglob("*"):
-            if f.is_file():
-                qa = json.load(f)
-                prompts.append(qa["problem"])
+        for file in path.rglob("*"):
+            if file.is_file():
+                with file.open("r") as f:
+                    qa = json.load(f)
+                prompts.append(prompt_template.format(question=qa["problem"]))
                 solutions.append(qa["solution"])
-
         tokenized = tokenize_prompt_and_output(prompts, solutions, tokenizer)
         self.input_ids = tokenized["input_ids"]
         self.labels = tokenized["labels"]
@@ -139,11 +149,30 @@ class MATHDataet(Dataset):
     @override
     def __getitem__(self, index):
         return self.input_ids[index], self.labels[index], self.response_mask[index]
-    
+
 
 def train():
-    pass
+    model_id = "Qwen/Qwen2.5-Math-1.5B"
+    tokenizer = AutoTokenizer.from_pretrained(model_id)
+    dataset = MATHDataet(
+        prompt_path="cs336_alignment/prompts/r1_zero.prompt",
+        data_path="./data/MATH/train",
+        tokenizer=tokenizer,
+    )
+    dataloader = DataLoader(dataset, batch_size=16)
+    llm = AutoModelForCausalLM.from_pretrained(model_id)
+    vllm_llm = init_vllm(model_id, device="cuda", seed=42, gpu_memory_utilization=0.5)
+    optimizer = AdamW(llm.parameters(), lr=1e-5)
+
+    for epoch in range(2):
+        for input_ids, labels, response_mask in dataloader:
+            policy_log_probs = get_response_log_probs(llm, input_ids, labels)["log_probs"]
+            loss, _ = sft_microbatch_train_step(policy_log_probs, response_mask, 4)
+            log.info(loss.item())
+            log.info("=================")
+            exit(0)
+    log.info(dataset[100])
 
 
-if __name__=="__main__":
-    pass
+if __name__ == "__main__":
+    train()
